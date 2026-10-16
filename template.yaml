@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless expense tracker with receipt processing (Textract)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: expense-tracker-users
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+
+  ReceiptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+
+  ExpensesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: userId, AttributeType: S}
+        - {AttributeName: expenseId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: userId, KeyType: HASH}
+        - {AttributeName: expenseId, KeyType: RANGE}
+
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        Authorizers:
+          CognitoAuth:
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: [!Ref UserPoolClient]
+            IdentitySource: $request.header.Authorization
+
+  UploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: upload_url.handler
+      Environment:
+        Variables:
+          BUCKET: !Ref ReceiptsBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref ReceiptsBucket
+      Events:
+        Post:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /receipts, Method: POST}
+
+  ProcessReceiptFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: process_receipt.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          TABLE: !Ref ExpensesTable
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ReceiptsBucket
+        - DynamoDBWritePolicy:
+            TableName: !Ref ExpensesTable
+        - Statement:
+            - Effect: Allow
+              Action: textract:AnalyzeExpense
+              Resource: '*'
+      Events:
+        Uploaded:
+          Type: S3
+          Properties:
+            Bucket: !Ref ReceiptsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - {Name: prefix, Value: receipts/}
+
+  ListExpensesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: list_expenses.handler
+      Environment:
+        Variables:
+          TABLE: !Ref ExpensesTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ExpensesTable
+      Events:
+        Get:
+          Type: HttpApi
+          Properties: {ApiId: !Ref Api, Path: /expenses, Method: GET}
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
